@@ -472,6 +472,9 @@ def main():
                 "band_size": stats["band_size"],
             }, ensure_ascii=False) + "\n")
             out.flush()
+            print(f"[qid {qid}] {op:14s} f1={f1:.2f}"
+                  f"  calls={stats['llm_calls']}"
+                  f"  cache={stats['cache_hit']}", flush=True)
 
     # ---- サマリ ----
     print(f"\n=== v1 {args.split} {'(dry-run)' if args.dry_run else ''} ===")
