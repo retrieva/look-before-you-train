@@ -1,9 +1,13 @@
-# step15_v22.py - CORE v2.2: recall-triage + full-text strict verification
+# step15_v22.py - CORE v2.2a: recall-triage + full-text strict verification
+#                  + aggregation-aware verification budget (min/max/topkは早期打ち切り)
 # 設計根拠:
 #   - GlobalQAのgoldは「keyword/semantic検索候補 + DeepSeekの全コーパス判定」で構築
 #     (arXiv:2510.26205 §3.2)。判定基準 = 中立・厳格なフルテキストLLM判定の再現
 #   - step14: 字句カバレッジではgoldを近似不可 (τ=1.0でもsetP=0.18) -> 意味判定必須
 #   - step11/13: 緩和プロンプトはFP epidemic。gold集合は常に<=50件 (train60中央値16)
+#   - v2.2a: min/max/topk は該当端から歩き、必要数確定で打ち切り (HANDOFF §3 の
+#     aggregation-aware selective verification の復活)。count/sort のみ全件検証。
+#     プロンプト不変・制御フローのみの変更なので PV=v22a のまま既存キャッシュを全額再利用
 # 三段構成:
 #   1) 候補: dense top-N ∪ BM25 top-N (N=200, union recall 96.8%)
 #   2) トリアージ (リコール志向): プロファイルを yes/maybe/no の3値で判定。
@@ -202,6 +206,12 @@ def verify_doc(preds, need_idx, d, stats):
     return {i: verify[(PV, preds[i], d)]["v"] for i in need_idx}
 
 # ---------------- クエリ実行 ----------------
+def _is_member(preds, combine, advance, d, stats):
+    vres = verify_doc(preds, advance[d], d, stats)
+    if combine == "or":
+        return any(vres.values())
+    return all(vres.get(i, False) for i in range(len(preds)))
+
 def run_query(r, args, stats):
     p = r["parsed"]
     preds, combine, op = p["predicates"], p["combine"], p["agg"]
@@ -235,21 +245,42 @@ def run_query(r, args, stats):
             if all(s != "no" for s in st):
                 advance[d] = list(range(len(preds)))
     stats["n_advance"] = len(advance)
+
+    # --- 極値系: 該当端から歩いて必要数で打ち切り (aggregation-aware) ---
+    if op in ("min_id", "max_id", "topk_smallest", "topk_largest"):
+        want = 1 if op in ("min_id", "max_id") else k
+        seq = sorted(advance)
+        if op in ("max_id", "topk_largest"):
+            seq = seq[::-1]
+        found = []
+        CH = 8
+        for i in range(0, len(seq), CH):
+            chunk = seq[i:i + CH]
+            res = {}
+            def h(d):
+                res[d] = _is_member(preds, combine, advance, d, stats)
+            with ThreadPoolExecutor(max_workers=4) as ex:
+                list(ex.map(h, chunk))
+            for d in chunk:                    # 端からの順序で採用
+                if res.get(d):
+                    found.append(d)
+            if len(found) >= want:
+                break
+        found = found[:want]
+        stats["n_member"] = len(found)         # 部分探索: 確定分のみ
+        if op in ("min_id", "max_id"):
+            return str(found[0]) if found else ""
+        return ", ".join(map(str, found))
+
+    # --- count/sort: 全件検証が不可避。コストガードはここにのみ適用 ---
     if len(advance) > args.max_advance:
         raise RuntimeError(
             f"advance={len(advance)} > --max-advance {args.max_advance}: "
-            f"トリアージが緩すぎるかクエリが広すぎる。コスト暴走防止で中断")
-
-    # --- フルテキスト厳格判定 -> member確定 ---
+            f"count/sortの全件検証コストが上限超過。--max-advanceを上げるか要相談")
     member = set()
     def handle(item):
         d, need = item
-        vres = verify_doc(preds, need, d, stats)
-        if combine == "or":
-            ok = any(vres.values())
-        else:
-            ok = all(vres.get(i, False) for i in range(len(preds)))
-        if ok:
+        if _is_member(preds, combine, advance, d, stats):
             with _lock:
                 member.add(d)
     with ThreadPoolExecutor(max_workers=4) as ex:
@@ -259,17 +290,8 @@ def run_query(r, args, stats):
     stats["n_member"] = len(ids)
     if len(ids) > 50:
         print(f"    [警告] |member|={len(ids)} > 50 (goldは常に<=50。判定が緩い疑い)")
-
     if op == "count":
         return str(len(ids))
-    if op == "min_id":
-        return str(ids[0]) if ids else ""
-    if op == "max_id":
-        return str(ids[-1]) if ids else ""
-    if op == "topk_smallest":
-        return ", ".join(map(str, ids[:k]))
-    if op == "topk_largest":
-        return ", ".join(map(str, ids[::-1][:k]))
     if op == "sort_asc":
         return ", ".join(map(str, ids))
     return ", ".join(map(str, ids[::-1]))    # sort_desc
@@ -279,8 +301,8 @@ def main():
     ap.add_argument("--split", default="train60", choices=["train60", "test100"])
     ap.add_argument("--n", type=int, default=200)
     ap.add_argument("--batch", type=int, default=10, help="トリアージのprofile数/呼び出し")
-    ap.add_argument("--max-advance", type=int, default=400, dest="max_advance",
-                    help="verify対象がこれを超えたら中断 (コスト暴走防止)")
+    ap.add_argument("--max-advance", type=int, default=1200, dest="max_advance",
+                    help="count/sortの全件検証がこれを超えたら中断 (コスト暴走防止)")
     ap.add_argument("--limit", type=int, default=0, help="先頭N問のみ(パイロット用)")
     args = ap.parse_args()
 
