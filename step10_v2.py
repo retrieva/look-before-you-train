@@ -7,7 +7,8 @@
 #   python step10_v2.py --split train60 --limit 15    # パイロット (目安 $1-1.5)
 #   python step10_v2.py --split train60               # 全60問 (目安 $5-6)
 # 冪等: judge_cache / confirm_cache / results_v2 すべてチェックポイント式
-import json, os, re, argparse, hashlib, collections
+import json, os, re, argparse, hashlib, collections, threading
+from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 from rank_bm25 import BM25Okapi
 from openai import OpenAI
@@ -106,6 +107,8 @@ JUDGE_SYS = (
     "satisfies at least one predicate, its number and the list of predicate indices "
     "it satisfies. Omit profiles that satisfy none.")
 
+_lock = threading.Lock()
+
 def judge_batch(preds, batch_ids, stats):
     plist = "\n".join(f"[{i}] {p}" for i, p in enumerate(preds))
     body = "\n\n".join(f"(profile {d})\n{profile_text(d)}" for d in batch_ids)
@@ -115,23 +118,26 @@ def judge_batch(preds, batch_ids, stats):
                   {"role": "user", "content":
                    f"PREDICATES:\n{plist}\n\nPROFILES:\n{body}"}],
         response_format=BATCH_SCHEMA))
-    stats["judge_calls"] += 1
     sat = collections.defaultdict(set)
     for it in json.loads(r.choices[0].message.content)["satisfying"]:
         for pi in it["predicates"]:
             if 0 <= pi < len(preds):
                 sat[it["profile"]].add(pi)
-    for d in batch_ids:
-        for i, p in enumerate(preds):
-            v = i in sat.get(d, set())
-            judge[(p, d)] = v
-            _save(_jf, p, d, v)
+    with _lock:
+        stats["judge_calls"] += 1
+        for d in batch_ids:
+            for i, p in enumerate(preds):
+                v = i in sat.get(d, set())
+                judge[(p, d)] = v
+                _save(_jf, p, d, v)
 
 def materialize(preds, combine, cands, stats, batch_size):
     todo = [d for d in cands
             if any((p, d) not in judge for p in preds) and d in profiles]
-    for i in range(0, len(todo), batch_size):
-        judge_batch(preds, todo[i:i + batch_size], stats)
+    batches = [todo[i:i + batch_size] for i in range(0, len(todo), batch_size)]
+    if batches:
+        with ThreadPoolExecutor(max_workers=4) as ex:
+            list(ex.map(lambda b: judge_batch(preds, b, stats), batches))
     member = set()
     for d in cands:
         vals = [judge.get((p, d), False) for p in preds]
