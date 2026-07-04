@@ -1,8 +1,19 @@
-# step10_v2.py - CORE v2: profile-based corpus scan engine
+# step10_v2.py - CORE v2.1: profile-based corpus scan engine
 #   候補生成: dense(embedding) top-N ∪ BM25 top-N   (実測 union recall 96.8% @ N=200)
-#   実体化:   候補プロファイルを25件/呼び出しで一括多値判定 (gpt-5-mini)
+#   実体化:   候補プロファイルを一括多値判定 (gpt-5-mini)
 #   極値保険: min/max/top-k の答え候補だけ原文全体でLLM最終確認
 #   集約:     コードで決定論的に実行
+# v2.1 変更点 (2026-07-05):
+#   [FIX-1] judge_batch: プロファイルを実doc IDではなく [PROFILE 0..N-1] の位置番号で
+#           提示し、返答の番号をコード側で batch_ids[pos] に写像。範囲外の番号は破棄。
+#           (旧実装は実IDの復唱に依存 -> 位置番号が返ると低IDに偽true蓄積 + 高IDが一律false)
+#   [FIX-2] JUDGE_SYS: インデックス番号のみで参照するよう明示
+#   [FIX-3] min/max フォールバック: confirmが明示的に棄却した文書は返さない。
+#           cap外の未確認先頭を優先し、それも無ければ従来通り端を返す
+# 注意: FIX-1/2 は判定プロンプトの変更なので、旧 judge_cache.jsonl は退避してから実行:
+#   mv judge_cache.jsonl judge_cache_poisoned.jsonl
+#   mv results_v2/v2_train60.jsonl results_v2/v2_train60_old.jsonl
+#   (confirm_cache.jsonl は実IDキーで有効なのでそのまま再利用可)
 # 使い方:
 #   python step10_v2.py --split train60 --limit 15    # パイロット (目安 $1-1.5)
 #   python step10_v2.py --split train60               # 全60問 (目安 $5-6)
@@ -100,29 +111,39 @@ BATCH_SCHEMA = {
             "required": ["profile", "predicates"], "additionalProperties": False}}},
         "required": ["satisfying"], "additionalProperties": False}}}
 
+# [FIX-2] インデックス番号のみで参照させる
 JUDGE_SYS = (
     "You judge which resume profiles satisfy which predicates. A profile satisfies a "
     "predicate if the person's roles, skills, tools, domains or experience clearly "
-    "match it, including obviously equivalent wording. Return, for each profile that "
-    "satisfies at least one predicate, its number and the list of predicate indices "
-    "it satisfies. Omit profiles that satisfy none.")
+    "match it, including obviously equivalent wording. Profiles are labeled "
+    "[PROFILE 0], [PROFILE 1], ... and predicates are labeled [0], [1], ... . "
+    "Refer to profiles and predicates ONLY by these bracketed index numbers; never "
+    "use any other identifiers that may appear inside the resume text. Return, for "
+    "each profile that satisfies at least one predicate, its profile index and the "
+    "list of predicate indices it satisfies. Omit profiles that satisfy none.")
 
 _lock = threading.Lock()
 
 def judge_batch(preds, batch_ids, stats):
     plist = "\n".join(f"[{i}] {p}" for i, p in enumerate(preds))
-    body = "\n\n".join(f"(profile {d})\n{profile_text(d)}" for d in batch_ids)
+    # [FIX-1] 位置番号でラベル (実doc IDはプロンプトに出さない)
+    body = "\n\n".join(f"[PROFILE {i}]\n{profile_text(d)}"
+                       for i, d in enumerate(batch_ids))
     r = with_retry(lambda: client.chat.completions.create(
         model=MODEL,
         messages=[{"role": "system", "content": JUDGE_SYS},
                   {"role": "user", "content":
                    f"PREDICATES:\n{plist}\n\nPROFILES:\n{body}"}],
         response_format=BATCH_SCHEMA))
-    sat = collections.defaultdict(set)
+    sat = collections.defaultdict(set)   # 実doc id -> 満たす述語indexの集合
     for it in json.loads(r.choices[0].message.content)["satisfying"]:
+        pos = it["profile"]
+        if not (0 <= pos < len(batch_ids)):
+            continue                      # 範囲外 (実IDの復唱など) は破棄
+        d = batch_ids[pos]                # [FIX-1] コード側で実IDに写像
         for pi in it["predicates"]:
             if 0 <= pi < len(preds):
-                sat[it["profile"]].add(pi)
+                sat[d].add(pi)
     with _lock:
         stats["judge_calls"] += 1
         for d in batch_ids:
@@ -198,7 +219,12 @@ def run_query(r, args, stats):
         for d in seq[:args.confirm_cap]:
             if confirm_doc(preds, combine, d, stats):
                 return str(d)
-        return str(seq[0]) if seq else ""       # 全滅なら未確認の端をフォールバック
+        # [FIX-3] 全滅時: confirmが明示的に棄却した文書は返さず、
+        #         cap外の未確認先頭を優先。memberがcap以下なら従来通り端を返す
+        rest = seq[args.confirm_cap:]
+        if rest:
+            return str(rest[0])
+        return str(seq[0]) if seq else ""
     if op in ("topk_largest", "topk_smallest"):
         seq = ids[::-1] if op == "topk_largest" else ids
         out, checked = [], 0
