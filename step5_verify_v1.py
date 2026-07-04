@@ -326,9 +326,14 @@ class Materializer:
             doc_leaf_sim[p], doc_best[p] = self.predicate_sims(p)
 
         # 葉ごとの3値化
+        # [v1.1] 極値系演算子 (min/max/top-k) は境界1点が答えを決めるため、
+        # HIGH以上でも無検証のINを作らない (答え候補は必ずLLMで確認する)。
+        # count/sort は集合全体の統計なので従来通りHIGHでIN確定してよい。
+        strict = op in ("min_id", "max_id", "topk_largest", "topk_smallest")
+        hi = float("inf") if strict else HIGH_THETA
         leaf_val = {
             p: {
-                d: (IN if s >= HIGH_THETA else OUT if s < LOW_THETA else UNC)
+                d: (IN if s >= hi else OUT if s < LOW_THETA else UNC)
                 for d, s in doc_leaf_sim[p].items()
             }
             for p in preds
