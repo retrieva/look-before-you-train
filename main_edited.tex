@@ -1,0 +1,244 @@
+\pdfoutput=1
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{booktabs}
+\usepackage{amsmath}
+\usepackage{graphicx}
+\usepackage{xcolor}
+\usepackage[colorlinks=true,linkcolor=blue,citecolor=blue,urlcolor=blue]{hyperref}
+\usepackage[activate=false]{microtype}
+
+\title{Look Before You Train: Train--Test Contamination in GlobalQA\\
+and a Training-Free Method that Reverse-Engineers Its Gold Rules}
+
+\author{Takao Morita\\
+Retrieva, Inc. \quad \texttt{takao.morita@retrieva.jp}}
+
+\date{July 2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+GlobalQA is a recent benchmark for corpus-level question answering, in which a system must aggregate information across an entire corpus (counting, sorting, and extremum queries over a collection of r\'esum\'es), and on which reinforcement-learning-based retrieval agents such as MARAG-R1 report a state-of-the-art answer-F1 of 28.60--31.22. While calibrating a simple training-free system against the GlobalQA training split, we discovered three facts that change how results on this benchmark should be interpreted. \textbf{(1) Contamination:} 1{,}073 of the 1{,}160 test questions (92.5\%) appear verbatim in the training set with identical answers and identical gold document sets; a trivial lookup baseline that copies the answer of the duplicated training question scores \textbf{92.5} answer-F1, roughly three times the published state of the art. We verified this on the official distribution. \textbf{(2) Reverse-engineerable gold rules:} the benchmark's gold document sets are not a pure function of document content. Using a scored LLM judge calibrated on 928 labeled pairs, we find that 30--46\% of non-gold documents in counting and minimum-ID questions receive perfect relevance scores, evidencing an annotation process of the form \emph{retrieval exposure $\cap$ lenient LLM judgment}. Because condition phrases are heavily reused across training questions (median support 86), the gold rule can be reconstructed as an explicit phrase-to-document-pool dictionary estimated from training labels. \textbf{(3) A strong training-free baseline:} combining query compilation into disjunctive normal form, the dictionary, and a lightweight LLM judge fallback yields 48.8 answer-F1 on the full test set \emph{under a twin-exclusion protocol that removes the verbatim duplicate before answering each question} --- exceeding the published RL state of the art, which was trained with the duplicates available, by 17.6 points, with no model training and about \$40 of API cost. On the 87 uncontaminated test questions, our method scores 22.0. We propose reporting both twin-excluded and clean-subset numbers on the current release, and we have notified the benchmark authors. Our goal is constructive: GlobalQA targets an important and under-studied capability, and we hope this analysis helps strengthen its next revision.
+\end{abstract}
+
+\section{Introduction}
+
+Corpus-level question answering asks a system to answer questions whose evidence is not a single passage but a property of an entire corpus: \emph{how many documents match a profile}, \emph{which matching document has the smallest ID}, \emph{sort all matching document IDs}. This is a genuinely different capability from standard retrieval-augmented generation, and GlobalQA \cite{globalqa} is, to our knowledge, the first benchmark to isolate it at scale: 2{,}047 r\'esum\'e documents, 12{,}875 training questions, and 1{,}160 test questions across seven aggregation types. The strongest published results come from MARAG-R1 \cite{marag}, a reinforcement-learned multi-tool retrieval agent from the same research group, reporting 28.60 (7B) and 31.22 (14B) answer-F1.
+
+This paper began as an attempt to solve GlobalQA without any model training, by compiling each question into an executable membership program. In the course of calibrating that system against the training split, we were forced to explain a sequence of surprising measurements --- an LLM verifier that rejected documents that plainly satisfied the query, ``gold'' documents that never mentioned the query's conditions, and finally a test-set score far above our own held-out generalization estimate. Tracing each surprise to its cause produced the three findings of this paper:\footnote{Code, calibration caches, and per-question outputs are available at \\url{https://github.com/retrieva/look-before-you-train}.}
+
+\begin{enumerate}
+\item \textbf{The test set is contaminated} (\S\ref{sec:contamination}). 92.5\% of test questions duplicate a training question verbatim --- same text, same answer, same gold document IDs. A ten-line lookup baseline scores 92.5 answer-F1.
+\item \textbf{The gold labels encode the construction pipeline, not just content} (\S\ref{sec:goldrules}). A calibrated 0--10 LLM judge assigns perfect relevance scores to 37.5\% of non-gold documents on counting questions and 45.8\% on minimum-ID questions; conversely, some gold documents never state the queried conditions. Gold membership is best modeled as \emph{exposure to the construction-time retriever} intersected with a \emph{lenient construction-time judge} --- a rule that no content-based prompt can fully recover, but that \emph{can} be estimated from training labels because condition phrases recur across hundreds of training questions.
+\item \textbf{A training-free system built on these findings is strong} (\S\ref{sec:method}--\ref{sec:results}). Under a twin-exclusion protocol (\S\ref{sec:protocol}) it reaches 48.8 answer-F1 on the full test set and 22.0 on the uncontaminated subset, versus 8.85 for a purely content-based verifier ancestor of the same system.
+\end{enumerate}
+
+We emphasize the spirit of this work. Benchmark construction at this scale is hard, question-generation pipelines naturally produce duplicates, and the contamination we report is the kind of defect that is nearly invisible unless a method happens to perform explicit matching against the training set --- which, notably, the RL state of the art does not: MARAG-R1 was trained on the very split containing the duplicates and still reports 31.22, indicating that its policy did not learn to exploit them. We notified the benchmark authors by email and through the dataset's Hugging Face discussion page before making this report public, and we frame our evaluation-protocol proposal (\S\ref{sec:protocol}) as a way to keep the current release usable while a de-duplicated revision is prepared.
+
+\section{The GlobalQA Benchmark}
+\label{sec:background}
+
+GlobalQA \cite{globalqa} consists of a corpus of 2{,}047 r\'esum\'es (\texttt{corpus.jsonl}), a training file of 12{,}875 question--answer pairs, and a test file of 1{,}160 pairs, distributed via Hugging Face.\footnote{\url{https://huggingface.co/datasets/QiiLuoo/GlobalQA}} Each item contains the question text, the answer string, and \texttt{golden\_doc\_ids}, the set of document IDs the question is about. Questions belong to seven aggregation families: \texttt{count}, \texttt{min\_id}, \texttt{max\_id}, \texttt{sort\_asc}, \texttt{sort\_desc}, \texttt{topk\_smallest}, \texttt{topk\_largest}. We verified on the training split that the answer string is a deterministic function of the gold set and the aggregation type for all 12{,}875 questions; an oracle given the gold sets scores 100.0. Evaluation is token-level F1 between predicted and gold answer strings, as in SQuAD \cite{squad}; for ID-sequence answers (sort, top-$k$) this metric is unforgiving, as a single missing or spurious ID perturbs the whole token bag, and for \texttt{count} it is essentially an exact-match metric.
+
+\section{Finding 1: Train--Test Contamination}
+\label{sec:contamination}
+
+While our held-out estimates on training subsets predicted test performance around 33 answer-F1 (\S\ref{sec:results}), our first full test run scored 48.8. Treating the 15.8-point overshoot as an anomaly to be explained rather than a success to be celebrated, we compared the two splits directly. The check is ten lines: normalize whitespace and case, then test exact string equality of question texts.
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lr}
+\toprule
+Test questions total & 1{,}160\\
+\quad with a verbatim twin in train & 1{,}073 \ (92.5\%)\\
+\qquad \ldots{}with identical answer string & 1{,}073 / 1{,}073\\
+\qquad \ldots{}with identical gold document set & 1{,}073 / 1{,}073\\
+\quad without any twin (``clean'') & 87 \ (7.5\%)\\
+Duplicate question texts \emph{within} train & 0\\
+\midrule
+Naive lookup baseline (copy twin's answer) & \textbf{92.5} answer-F1\\
+Published state of the art (MARAG-R1 14B) & 31.22\\
+\bottomrule
+\end{tabular}
+\caption{Contamination statistics, verified on the official Hugging Face distribution. Because the training set contains no internal duplicates, every contaminated test question has exactly one twin, which makes the twin-exclusion protocol of \S\ref{sec:protocol} well defined.}
+\label{tab:contamination}
+\end{table}
+
+Three consequences follow. First, published scores on GlobalQA cannot be interpreted as generalization measures without qualification: a method with incidental access to training question--answer associations has a 92.5-point ceiling available through memorization alone. Second, and more interestingly, the RL state of the art did \emph{not} reach that ceiling despite being trained on the split that contains every twin; a 7B--14B policy trained with RL over retrieval tools evidently does not learn verbatim question--answer recall over 12.9k items, which is itself informative about what such training does and does not internalize. Third, the 87 clean questions form a small but uniquely valuable probe of out-of-distribution generalization, which we exploit in \S\ref{sec:results}.
+
+We reproduced all numbers in Table~\ref{tab:contamination} on freshly downloaded official files before submission.
+
+\section{Finding 2: Anatomy of the Gold Rules}
+\label{sec:goldrules}
+
+\subsection{Content alone does not determine gold membership}
+
+We calibrated LLM relevance judges on 928 (question, document, label) pairs drawn from 35 stratified training questions, pairing each question's gold documents (capped at 20) with an equal number of top-ranked BM25 non-gold documents. An initial binary judge achieved only a 70.3\% true-positive rate at a 36.2\% false-positive rate. A second round replaced the binary decision with a 0--10 score under a band-anchored rubric. The scored judge exposes the structure of the disagreement (Table~\ref{tab:undecidable}): on \texttt{count} and \texttt{min\_id} questions, 37.5\% and 45.8\% of \emph{non-gold} documents receive near-perfect scores ($\geq 9$), i.e.\ their content fully matches the query by the judge's reading; conversely, some gold documents receive mid or low scores.
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lccccccc}
+\toprule
+ & count & min\_id & sort\_desc & topk\_l & topk\_s & max\_id & sort\_asc\\
+\midrule
+Non-gold with judge score $\geq 9$ & 37.5\% & 45.8\% & 32.5\% & 8.5\% & 7.1\% & 4.2\% & 3.3\%\\
+\bottomrule
+\end{tabular}
+\caption{The \emph{undecidable component}: fraction of non-gold documents that a calibrated 0--10 judge scores as perfect matches (928 labeled pairs, gpt-5-mini judge). No content-based verifier, however well prompted, can separate these from gold documents.}
+\label{tab:undecidable}
+\end{table}
+
+The natural explanation, consistent with every qualitative case we inspected, is that gold sets were produced by a construction pipeline of the form \emph{run a retriever, then filter candidates with a lenient LLM judgment}: documents that satisfy the query but were never exposed to the construction-time retriever cannot be gold, and documents loosely matching the query's occupational neighborhood sometimes are. Supporting evidence includes gold documents containing none of the query's condition keywords, and the corpus being sorted by occupation so that gold sets concentrate in contiguous ID neighborhoods.
+
+\subsection{The rule is recoverable from training labels}
+
+Although the gold rule is not expressible as a content predicate, it is \emph{learnable as a lookup structure}, because the question-generation pipeline heavily reuses condition phrases: the phrase \emph{``foreign currency revaluation''} occurs in 1{,}089 training questions (counting questions whose text contains the phrase), and across the condition phrases of our 60-question tuning sample the median number of supporting training questions per phrase is, under the same definition, 86. For a phrase $p$, define its \textbf{pool} as
+\[
+\mathrm{pool}_\theta(p) \;=\; \{\, d : \operatorname{freq}(d \in \mathrm{gold}(q) \mid p \in q) \geq \theta \,\},
+\]
+the documents that appear in at least a $\theta$ fraction of the gold sets of training questions containing $p$ (with word-boundary matching, generic-prefix stripping, and a pool-size cap; Appendix~\ref{app:hyper}). Pools estimated this way directly capture the exposure component that content judges cannot see. This construction is the core of our method and, we would argue, an explicit reconstruction of what any system that improves with GlobalQA training data --- including an RL policy --- must be implicitly learning.
+
+\section{Method: Compile, Look Up, Verify}
+\label{sec:method}
+
+Our system answers a question in four stages, uses no trained parameters, and calls an LLM only where the dictionary is silent.
+
+\paragraph{1. Compile.} A parser (gpt-5-mini, JSON-schema constrained; prompt in Appendix~\ref{app:prompts}) compiles the question into an aggregation type, an optional $k$, and a document-selection condition in disjunctive normal form (DNF): a list of AND-clauses of natural-language predicates.
+
+\paragraph{2. Look up.} Each clause is evaluated against the dictionary: a document is a clause member if its minimum pool frequency across the clause's phrases is $\geq \theta$ ($\theta{=}0.3$; $\theta{=}0.45$ for \texttt{count}, calibrated on 126 held-out OR-form counting questions, where it achieves 62.5\% exact-count accuracy). The question's member set is the union over clauses. Crucially, when estimating pools we \emph{exclude any training question whose normalized text equals the query} --- at test time this removes exactly the contaminated twin (\S\ref{sec:protocol}). An empty pool for a fully supported clause is treated as information (``the construction pipeline admitted nothing for this conjunction'') and contributes nothing.
+
+\paragraph{3. Verify (fallback only).} Only when the dictionary produces an empty member set for the \emph{entire} question do we fall back to content: candidates from BM25 $\cup$ BGE-large \cite{bge} retrieval per phrase are scored 0--10 by a rubric-anchored judge (gpt-5-mini), admitted at score $\geq 8$ (capped per clause), with a final rescue rule that answers from the top-scored candidates rather than returning an empty answer. This division of labor is not an aesthetic choice but a measured one: on questions where the dictionary produced partial members, adding judge-admitted documents \emph{reduced} accuracy (perfect-scoring non-gold documents from Table~\ref{tab:undecidable} steal extremum answers), whereas on dictionary-empty questions the judge recovered answers the dictionary could not see.
+
+\paragraph{4. Aggregate.} The member set is aggregated per the compiled program (count, min/max, sort, top-$k$) and formatted for token-F1 evaluation.
+
+\paragraph{Development discipline.} All hyperparameters were tuned on a 60-question training subset plus held-out training-side calibration sets, then \emph{frozen}; a fresh 60-question training slice (disjoint from all tuning and calibration data) was evaluated once to measure the generalization gap (42.0 $\rightarrow$ 34.6); and the test set was run exactly once, with the outcome pre-registered (predicted center 33; the +15.8 surprise is what led to \S\ref{sec:contamination}). No test-derived information influenced any design decision.
+
+\section{Proposed Evaluation Protocol}
+\label{sec:protocol}
+
+Until a de-duplicated release exists, we propose that results on the current GlobalQA release report two numbers:
+
+\begin{enumerate}
+\item \textbf{Twin-excluded full test.} For each test question, any verbatim-identical training question is removed from whatever training-derived resources the method uses, before answering. Because the training set contains no internal duplicates (Table~\ref{tab:contamination}), this removes exactly one item and is unambiguous. This is a leave-one-out measure of \emph{in-distribution} generalization: sibling questions sharing phrases remain available, as they would for any method trained on the split.
+\item \textbf{Clean subset.} The 87 test questions with no twin, reported separately as an \emph{out-of-distribution} probe. We release the index list as an ancillary file accompanying this submission. Confidence intervals are wide ($n{=}87$; roughly $\pm 8$ points at 95\%) and should be stated.
+\end{enumerate}
+
+Under this lens, published training-based results are most comparable to our twin-excluded numbers --- with the caveat, favorable to prior work's integrity but unfavorable to its ceiling, that prior methods were trained \emph{with} the twins available.
+
+\section{Results}
+\label{sec:results}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lccc}
+\toprule
+ & Full test (1{,}160) & Twin subset (1{,}073) & Clean subset (87)\\
+\midrule
+Naive train lookup (diagnostic) & 92.5 & 100.0 & 0.0\\
+\midrule
+MARAG-R1 7B \cite{marag}$^{\dagger}$ & 28.60 & --- & ---\\
+MARAG-R1 14B \cite{marag}$^{\dagger}$ & 31.22 & --- & ---\\
+\midrule
+Content-only verifier (v2.5, ours) & --- & --- & 17.7\\
+Dictionary only (ours) & 45.7 & 48.6 & 9.8\\
+\textbf{Dictionary + judge fallback (ours)} & \textbf{48.8} & \textbf{51.0} & \textbf{22.0}\\
+\bottomrule
+\end{tabular}
+\caption{Answer-F1 on the GlobalQA test set. Our methods use the twin-exclusion protocol of \S\ref{sec:protocol}; ``Dictionary only'' is the frozen full system with the judge fallback and rescue disabled. $^{\dagger}$MARAG-R1 numbers are as published, obtained with the duplicates present in its RL training data (per-subset breakdowns are not available). The content-only verifier is expensive per question and was run on the clean subset only; its score on a 60-question training sample is 8.85.}
+\label{tab:main}
+\end{table}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lccccccc|c}
+\toprule
+ & count & max\_id & min\_id & sort\_asc & sort\_desc & topk\_l & topk\_s & ALL\\
+$n$ & 215 & 177 & 198 & 105 & 99 & 192 & 174 & 1160\\
+\midrule
+Dictionary only & 27.4 & 51.4 & 51.5 & 51.8 & 49.0 & 47.7 & 47.9 & 45.7\\
+Dict.\ + judge & 28.8 & 53.1 & 53.5 & 58.1 & 53.2 & 53.2 & 50.9 & \textbf{48.8}\\
+\bottomrule
+\end{tabular}
+\caption{Per-task answer-F1 on the full test set (twin-excluded protocol). Membership-set F1 of the full system is 62.4.}
+\label{tab:pertask}
+\end{table}
+
+\paragraph{Headline.} The full system reaches 48.8 answer-F1 (Table~\ref{tab:main}), +17.6 over the published 14B RL state of the art, with no training and roughly \$40 of total API cost across all development and evaluation. The comparison carries an a-fortiori flavor: our number is computed with the duplicate twin \emph{removed}, while the RL baseline trained with twins present.
+
+\paragraph{In- vs.\ out-of-distribution division of labor.} The three-way ablation on the clean subset is the most instructive result. The dictionary, dominant in distribution (48.6 on twins), collapses to 9.8 out of distribution; the purely content-based verifier, weak in distribution (8.85 on training samples), holds at 17.7; and the hybrid's 22.0 shows the judge fallback carrying most of the out-of-distribution weight (+12.1 over dictionary-only). Construction-pipeline knowledge and content verification are complementary, and GlobalQA as currently released mostly rewards the former.
+
+\paragraph{Counting remains hard for everyone.} Token-F1 on \texttt{count} demands the exact integer. Our 28.8 (Table~\ref{tab:pertask}) compares to MARAG-R1's reported 5.6--7.4 on this family, but is driven by OR-form counting questions where the calibrated dictionary threshold yields exact counts 62.5\% of the time on held-out data; conjunctive counting questions remain largely unsolved, consistent with the undecidable component of Table~\ref{tab:undecidable} being largest for \texttt{count}.
+
+\paragraph{Generalization accounting.} Our development trajectory --- 42.0 on the tuning slice, 34.6 on a frozen-configuration fresh slice, 48.8 on test --- brackets the honest expectation. The test-side surplus over 34.6 tracks a measurable difference in training support: extracting condition phrases with a label-free proxy, the median number of supporting training questions per phrase is 27 on test versus 9 on the fresh slice (21 on the tuning slice, 23 on a random 300-question training sample), and the fraction of phrases with $\geq 3$ supporting questions is 69.0\% on test versus 62.8\% on the fresh slice (73.7\% on the tuning slice). The test distribution is thus not harder than the training distribution --- merely better supported than our fresh slice, consistent with the high-reuse generation trajectories that produced the duplicates being over-represented on test.
+
+\section{Limitations}
+\label{sec:limitations}
+
+Our dictionary is an adaptation to GlobalQA's construction structure, not a general QA technique; its collapse on the clean subset quantifies exactly how much. The clean subset is small ($n{=}87$), so its comparisons carry wide intervals. The content-only verifier was not run on the full test set for cost reasons. We did not evaluate on a second corpus-level benchmark, and we did not implement the benchmark's auxiliary document-level metric. Hyperparameters were iterated on one 60-question training slice before freezing; while a disjoint slice and a single-shot test guard against test leakage, they do not remove all researcher degrees of freedom. Finally, per-question outputs of prior systems are unavailable, so clean-subset comparisons to the RL state of the art are not possible; we encourage authors of GlobalQA systems to release per-question predictions.
+
+\section{Ethics and Disclosure}
+
+We notified the GlobalQA authors of the contamination finding by email and via the dataset's public Hugging Face discussion page on 7 July 2026, before public release of this report, offering duplicate indices and assistance in validating a de-duplicated split. We used the test set exactly once, after freezing all design choices, with pre-registered predictions; no result in this paper reflects test-informed tuning. We report the naive lookup number as a diagnostic of the benchmark, not as a method. The benchmark and the RL state of the art originate from the same research group; we note this only as provenance context, and we see the contamination as an ordinary pipeline de-duplication oversight of a kind that is easy to miss --- indeed, the group's own RL results show no sign of exploiting it.
+
+\section{Conclusion}
+
+GlobalQA measures something important, and our findings are offered to make it measure that thing better. In its current release, 92.5\% train--test duplication makes headline numbers memorization-bounded; the gold labels contain a construction-pipeline component that content-based methods cannot reach but training labels reveal; and once both facts are handled explicitly --- twin-excluded evaluation, dictionary reconstruction of the gold rule, content verification where the dictionary is silent --- a training-free system exceeds the RL state of the art by a wide margin at negligible cost. We hope the twin-excluded and clean-subset protocol keeps the current release useful, and we look forward to a de-duplicated revision, on which the clean-subset column of Table~\ref{tab:main} suggests the real contest between construction-rule learning and content reasoning is still wide open.
+
+\appendix
+
+\section{Hyperparameters and Frozen Configuration}
+\label{app:hyper}
+
+Dictionary: word-boundary phrase matching over whitespace/case-normalized training questions; minimum support 3 questions; membership threshold $\theta{=}0.3$ ($0.45$ for \texttt{count}, calibrated on 126 held-out OR-form counting questions disjoint from all evaluation slices); phrase variants by generic-prefix stripping (\emph{documents about, include, related to,} \ldots) and head-segment truncation at \emph{with/and/or/in/for}; pools larger than 60 documents at threshold are rejected (gold sets never exceed 50). Judge fallback: activated only when the dictionary yields zero members for the whole question; candidates are BM25 top-30 $\cup$ BGE-large top-30 per phrase; 0--10 rubric-anchored scoring with gpt-5-mini; admission at score $\geq 8$, at most 25 per clause; if the final member set is empty, the top-5 scored candidates (top-$k$ for top-$k$ questions) are used. Retrieval: BM25 (Okapi) \cite{bm25} over full documents; BGE-large-en-v1.5 \cite{bge} over 6{,}000-character chunks with max-chunk pooling per document. Documents shown to the judge are truncated to their first 24{,}000 characters. All LLM calls use temperature-default gpt-5-mini with JSON-schema-constrained outputs and are cached by (prompt-version, question, document).
+
+\section{Prompts}
+\label{app:prompts}
+
+\paragraph{DNF compiler (system prompt).} Compiles the question into \{agg, k, clauses\}; instructs distribution of shared conjuncts over disjunctions (``either A or B, and also C'' $\rightarrow$ [[A,C],[B,C]]), treats topic enumerations as disjunctions, and forbids `or' inside a predicate. Full text in the released code.\footnote{\\url{https://github.com/retrieva/look-before-you-train}}
+
+\paragraph{Scored judge (system prompt).} ``You rate document relevance for a corpus-level query over a resume corpus. Output an integer 0--10. Rubric: 9--10 = unambiguously one of the documents the query asks about (matches the full profile/conditions described); 7--8 = very likely a match but one condition is implicit or only weakly evidenced; 4--6 = same occupation family or satisfies only part of the conditions; 2--3 = tangential overlap only; 0--1 = unrelated. Avoid defaulting to 0/5/10; first choose the band, then pick the exact integer within it to express confidence.''
+
+\section{Reproducing the Contamination Check}
+\label{app:repro}
+
+\begin{verbatim}
+import json, re
+tr = json.load(open("train (1).json")); te = json.load(open("test (3).json"))
+n = lambda s: re.sub(r"\s+", " ", s.lower()).strip()
+by = {n(t["question"]): t for t in tr}
+d = sum(1 for t in te if n(t["question"]) in by)
+print(d, "/", len(te))   # -> 1073 / 1160
+\end{verbatim}
+
+\begin{thebibliography}{9}
+
+\bibitem{globalqa}
+Qi Luo, Xiaonan Li, Tingshuo Fan, Xinchi Chen, Xipeng Qiu.
+\newblock Towards Global Retrieval Augmented Generation: A Benchmark for Corpus-Level Reasoning.
+\newblock arXiv:2510.26205, 2025.
+
+\bibitem{marag}
+Qi Luo, Xiaonan Li, Yuxin Wang, Tingshuo Fan, Yuan Li, Xinchi Chen, Xipeng Qiu.
+\newblock MARAG-R1: Beyond Single Retriever via Reinforcement-Learned Multi-Tool Agentic Retrieval.
+\newblock arXiv:2510.27569, 2025.
+
+\bibitem{squad}
+Pranav Rajpurkar, Jian Zhang, Konstantin Lopyrev, Percy Liang.
+\newblock SQuAD: 100,000+ Questions for Machine Comprehension of Text.
+\newblock EMNLP 2016.
+
+\bibitem{bm25}
+Stephen Robertson, Hugo Zaragoza.
+\newblock The Probabilistic Relevance Framework: BM25 and Beyond.
+\newblock Foundations and Trends in Information Retrieval, 2009.
+
+\bibitem{bge}
+Shitao Xiao, Zheng Liu, Peitian Zhang, Niklas Muennighoff.
+\newblock C-Pack: Packaged Resources To Advance General Chinese Embedding.
+\newblock arXiv:2309.07597, 2023.
+
+\end{thebibliography}
+
+\end{document}

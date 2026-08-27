@@ -115,3 +115,5 @@ the single test run; no test-informed tuning.
 ## License
 
 See `LICENSE`. The GlobalQA dataset itself is subject to its own terms on Hugging Face.
+
+The paper text (main_edited.tex / PDF) is © Takao Morita; the license above applies to the code.
