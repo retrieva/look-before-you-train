@@ -3,7 +3,9 @@
 Code, calibration caches, and per-question results for the paper:
 
 > **Look Before You Train: Train–Test Contamination in GlobalQA and a Training-Free Method that Reverse-Engineers Its Gold Rules**
-> Takao Morita (Retrieva, Inc.), 2026. arXiv: *(link to be added upon announcement)*
+> Takao Morita (Retrieva, Inc.), 2026. Preprint DOI: [10.5281/zenodo.22147771](https://doi.org/10.5281/zenodo.22147771)
+
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.22147771.svg)](https://doi.org/10.5281/zenodo.22147771)
 
 **TL;DR.** 1,073 of the 1,160 GlobalQA test questions (92.5%) appear verbatim in the training
 set with identical answers and identical gold document sets; a trivial train-lookup baseline
@@ -103,12 +105,14 @@ the single test run; no test-informed tuning.
 ## Citation
 
 ```bibtex
-@article{morita2026lookbeforeyoutrain,
-  title  = {Look Before You Train: Train--Test Contamination in GlobalQA and a
-            Training-Free Method that Reverse-Engineers Its Gold Rules},
-  author = {Morita, Takao},
-  year   = {2026},
-  note   = {arXiv preprint}
+@misc{morita2026lookbeforeyoutrain,
+  title     = {Look Before You Train: Train--Test Contamination in GlobalQA and a
+               Training-Free Method that Reverse-Engineers Its Gold Rules},
+  author    = {Morita, Takao},
+  year      = {2026},
+  publisher = {Zenodo},
+  doi       = {10.5281/zenodo.22147771},
+  url       = {https://doi.org/10.5281/zenodo.22147771}
 }
 ```
 
