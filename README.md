@@ -6,6 +6,7 @@ Code, calibration caches, and per-question results for the paper:
 > Takao Morita (Retrieva, Inc.), 2026. Preprint DOI: [10.5281/zenodo.22147771](https://doi.org/10.5281/zenodo.22147771)
 
 [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.22147771.svg)](https://doi.org/10.5281/zenodo.22147771)
+[![Code DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.22284015.svg)](https://doi.org/10.5281/zenodo.22284015)
 
 **TL;DR.** 1,073 of the 1,160 GlobalQA test questions (92.5%) appear verbatim in the training
 set with identical answers and identical gold document sets; a trivial train-lookup baseline
@@ -113,6 +114,17 @@ the single test run; no test-informed tuning.
   publisher = {Zenodo},
   doi       = {10.5281/zenodo.22147771},
   url       = {https://doi.org/10.5281/zenodo.22147771}
+}
+
+
+@software{morita2026lookbeforeyoutrain_code,
+  author    = {Morita, Takao},
+  title     = {retrieva/look-before-you-train: v1.0.0},
+  year      = {2026},
+  publisher = {Zenodo},
+  version   = {v1.0.0},
+  doi       = {10.5281/zenodo.22284016},
+  url       = {https://doi.org/10.5281/zenodo.22284016}
 }
 ```
 
