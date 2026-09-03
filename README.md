@@ -118,12 +118,12 @@ the single test run; no test-informed tuning.
 
 @software{morita2026lookbeforeyoutrain_code,
   author    = {Morita, Takao},
-  title     = {retrieva/look-before-you-train: v1.0.0},
+  title     = {retrieva/look-before-you-train},
   year      = {2026},
   publisher = {Zenodo},
-  version   = {v1.0.0},
-  doi       = {10.5281/zenodo.22284016},
-  url       = {https://doi.org/10.5281/zenodo.22284016}
+  note      = {Concept DOI; resolves to the latest release},
+  doi       = {10.5281/zenodo.22284015},
+  url       = {https://doi.org/10.5281/zenodo.22284015}
 }
 ```
 
