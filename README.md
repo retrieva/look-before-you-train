@@ -25,6 +25,7 @@ under a twin-exclusion protocol, and **22.0** on the 87 uncontaminated test ques
 | Content-only verifier 17.7 (clean 87) | `v25_clean87_gpt_m30.jsonl` |
 | Tuning slice 42.0 / fresh slice 34.6 | `results_v30f_train60_slice2.jsonl` (two samples in one file; split by `idx` against `parsed2_train60.jsonl`) |
 | Judge calibration (928 pairs; perfect-scoring non-gold rates 37.5% / 45.8% / ...) | `calib_cache.jsonl` (`pv=q2b-gpt`, binary round `pv=q1-gpt`) + `step33b_scorejudge2.py --sweep-only` (zero API cost) |
+| Pre-registered predictions (predict → pay → adjudicate; test-run centre 33) | `PREREGISTRATION.md` |
 | Contamination 1,073/1,160; lookup 92.5 | 10-line check in Appendix C of the paper (normalize whitespace/case, exact question-text match) |
 
 The clean-87 index list (0-based positions in the official test file) is distributed as an
